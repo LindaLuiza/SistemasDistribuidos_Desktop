@@ -1,0 +1,714 @@
+\documentclass[11pt,a4paper]{article}
+
+% ------------------------------------------------------------------
+% Pacotes (todos padrão no TeX Live, MiKTeX e Overleaf)
+% ------------------------------------------------------------------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[brazilian]{babel}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{caption}
+\usepackage[table]{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,shapes.geometric}
+\usepackage{listings}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{destaque}{RGB}{0,90,160}
+\definecolor{cinza}{RGB}{110,110,110}
+\definecolor{fundo}{RGB}{245,245,245}
+
+% Listagens: acentos em UTF-8 funcionam via "literate"
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{fundo},
+  frame=single, rulecolor=\color{cinza!50},
+  breaklines=true, columns=fullflexible,
+  keywordstyle=\color{destaque}\bfseries,
+  commentstyle=\color{cinza}\itshape,
+  literate={á}{{\'a}}1 {ã}{{\~a}}1 {â}{{\^a}}1 {à}{{\`a}}1
+           {é}{{\'e}}1 {ê}{{\^e}}1 {í}{{\'i}}1 {ó}{{\'o}}1
+           {õ}{{\~o}}1 {ô}{{\^o}}1 {ú}{{\'u}}1 {ç}{{\c{c}}}1
+           {Á}{{\'A}}1 {É}{{\'E}}1 {Ç}{{\c{C}}}1
+}
+
+% Pseudocódigo em português
+\algrenewcommand\algorithmicif{\textbf{se}}
+\algrenewcommand\algorithmicthen{\textbf{então}}
+\algrenewcommand\algorithmicelse{\textbf{senão}}
+\algrenewcommand\algorithmicend{\textbf{fim}}
+\algrenewcommand\algorithmicwhile{\textbf{enquanto}}
+\algrenewcommand\algorithmicdo{\textbf{faça}}
+\algrenewcommand\algorithmicfor{\textbf{para}}
+\algrenewcommand\algorithmicprocedure{\textbf{procedimento}}
+\algrenewcommand\algorithmicfunction{\textbf{função}}
+\algrenewcommand\algorithmicreturn{\textbf{retorne}}
+\floatname{algorithm}{Algoritmo}
+\renewcommand{\listalgorithmname}{Lista de algoritmos}
+
+\newcommand{\msg}[1]{\texttt{#1}}
+\newcommand{\classe}[1]{\texttt{#1}}
+% Estados do algoritmo em versalete, sempre na vertical (não há versalete itálico no Latin Modern)
+\newcommand{\estado}[1]{\textup{\textsc{#1}}}
+
+\title{\textbf{Mecanismo de Consistência entre os Servidores de Dados}\\[4pt]
+\large Exclusão mútua distribuída (Ricart-Agrawala) e replicação síncrona\\[2pt]
+\normalsize Projeto de Implementação Desktop -- Sistemas Distribuídos 2026/2}
+\author{Dupla: \textit{[preencher os nomes]}}
+\date{Outubro de 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Este documento descreve a arquitetura do sistema distribuído desenvolvido no projeto e,
+em detalhe, o mecanismo de consistência entre os dois servidores de dados. A solução
+combina exclusão mútua distribuída pelo algoritmo de Ricart-Agrawala, com ordenação dos
+pedidos por relógios lógicos de Lamport, e replicação síncrona com confirmação
+(\msg{REPLICAR}/\msg{ACK}). São apresentados os fundamentos teóricos, a justificativa
+da escolha frente às alternativas, o projeto da implementação, argumentos de correção,
+o plano de testes e as limitações conhecidas.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+% ==================================================================
+\section{Introdução}
+% ==================================================================
+
+O enunciado do projeto exige um sistema em camadas com 2 clientes, 1 balanceador de
+carga, 3 servidores de aplicação e 2 servidores de dados, todos comunicando-se por
+\emph{sockets} TCP. Cada servidor de dados mantém um arquivo local, e o enunciado
+impõe três requisitos sobre eles:
+
+\begin{enumerate}[label=\textbf{R\arabic*.}]
+  \item Após toda escrita (nova linha) em um dos arquivos, a consistência deve ser
+        disparada.
+  \item Nenhuma nova requisição pode ser atendida antes do término da consistência.
+  \item Ao final de cada escrita e ao término da execução, os dois arquivos devem
+        conter os mesmos valores, sem duplicatas.
+\end{enumerate}
+
+Além disso, \textbf{nenhuma requisição dos clientes pode ser perdida}: todo número
+distinto registrado nos logs dos clientes deve estar presente nos arquivos dos
+servidores de dados.
+
+O mecanismo de consistência vale 3 dos 10 pontos do trabalho e é o foco deste
+documento (Seções~\ref{sec:fundamentos} a~\ref{sec:limitacoes}). A
+Seção~\ref{sec:arquitetura} apresenta o restante do sistema, necessário para entender
+o contexto em que a consistência opera.
+
+% ==================================================================
+\section{Visão geral do sistema}
+\label{sec:arquitetura}
+% ==================================================================
+
+\subsection{Componentes e portas}
+
+Todos os componentes são executáveis independentes em \texttt{localhost}; portas
+diferentes simulam máquinas diferentes (Tabela~\ref{tab:portas}).
+
+\begin{table}[H]
+\centering
+\caption{Componentes do sistema e portas utilizadas.}
+\label{tab:portas}
+\begin{tabular}{@{}llp{7.2cm}@{}}
+\toprule
+\textbf{Componente} & \textbf{Porta(s)} & \textbf{Papel} \\
+\midrule
+Cliente 1 e 2           & --          & Sorteia números de 1 a 1000 e envia ao balanceador. \\
+Balanceador             & 5000        & \emph{Proxy} Round Robin entre os servidores de aplicação. \\
+Servidores de Aplicação & 6001--6003  & Uma \emph{thread worker} por requisição: primalidade e consulta ao servidor de dados. \\
+Servidores de Dados     & 7001--7002  & Atendem os \emph{workers}: verificam e inserem no arquivo local. \\
+Canal de sincronização  & 7101--7102  & Comunicação entre os dois servidores de dados (exclusão mútua e replicação). \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[tbp]
+\centering
+\begin{tikzpicture}[
+  caixa/.style={draw, rounded corners, minimum width=2.3cm, minimum height=0.9cm,
+                align=center, font=\small, fill=white},
+  seta/.style={-{Stealth[length=2.2mm]}, thick},
+  sync/.style={{Stealth[length=2.2mm]}-{Stealth[length=2.2mm]}, thick, destaque, dashed}
+]
+\node[caixa] (c1) at (0, 1.2)  {Cliente 1};
+\node[caixa] (c2) at (0,-1.2)  {Cliente 2};
+\node[caixa] (b)  at (3.2,0)   {Balanceador\\\scriptsize :5000};
+\node[caixa] (a1) at (6.5, 1.8) {App 1\\\scriptsize :6001};
+\node[caixa] (a2) at (6.5, 0)   {App 2\\\scriptsize :6002};
+\node[caixa] (a3) at (6.5,-1.8) {App 3\\\scriptsize :6003};
+\node[caixa] (d1) at (10, 1.1)  {Dados 1\\\scriptsize :7001};
+\node[caixa] (d2) at (10,-1.1)  {Dados 2\\\scriptsize :7002};
+\draw[seta] (c1) -- (b); \draw[seta] (c2) -- (b);
+\draw[seta] (b) -- (a1); \draw[seta] (b) -- (a2); \draw[seta] (b) -- (a3);
+\foreach \x in {a1,a2,a3} { \draw[seta, cinza] (\x) -- (d1); \draw[seta, cinza] (\x) -- (d2); }
+\draw[sync] (d1.east) to[bend left=40] node[right, font=\scriptsize, align=left]
+      {:7101/:7102\\REQUEST/OK\\REPLICAR/ACK} (d2.east);
+\end{tikzpicture}
+\caption{Arquitetura em camadas. Setas cinzas: o \emph{worker} sorteia um dos
+servidores de dados. Tracejado: canal de sincronização entre os servidores de dados.}
+\label{fig:arquitetura}
+\end{figure}
+
+\subsection{Protocolo de mensagens}
+
+O protocolo é textual, com uma mensagem por linha e campos separados por ponto e
+vírgula (Tabela~\ref{tab:protocolo}). Mensagens textuais facilitam a depuração (podem
+ser lidas no console) e a demonstração.
+
+\begin{table}[H]
+\centering
+\caption{Mensagens trocadas entre os componentes.}
+\label{tab:protocolo}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Origem $\rightarrow$ Destino} & \textbf{Mensagem} & \textbf{Significado} \\
+\midrule
+Cliente $\rightarrow$ Balanc. $\rightarrow$ App & \msg{CHECK;n}              & Pedido de verificação do número $n$ \\
+App $\rightarrow$ Balanc. $\rightarrow$ Cliente & \msg{RECEBIDO;n}           & Confirmação imediata de recebimento \\
+App $\rightarrow$ Dados                         & \msg{CHECK;n}              & Consulta/inserção de $n$ \\
+Dados $\rightarrow$ App                         & \msg{INSERIDO;n;linha}     & $n$ não existia e foi inserido \\
+Dados $\rightarrow$ App                         & \msg{EXISTE;n;linha}       & $n$ já existia na linha informada \\
+\midrule
+Dados $\leftrightarrow$ Dados                   & \msg{REQUEST;ts;id}        & Pedido de entrada na seção crítica \\
+Dados $\leftrightarrow$ Dados                   & \msg{OK;id}                & Permissão concedida \\
+Dados $\leftrightarrow$ Dados                   & \msg{REPLICAR;n;linha}     & Réplica de uma escrita \\
+Dados $\leftrightarrow$ Dados                   & \msg{ACK}                 & Réplica gravada \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Decisões de projeto das demais camadas}
+
+\paragraph{Balanceador: Round Robin como \emph{proxy}.}
+O cliente conhece um único endereço; o balanceador repassa o \msg{CHECK} ao servidor
+de aplicação da vez e devolve o \msg{RECEBIDO}. A escolha do Round Robin se justifica
+porque os servidores são idênticos e as requisições são homogêneas: o teste de
+primalidade para $n \le 1000$ custa no máximo cerca de 16 divisões, e o tempo de
+cada requisição é dominado pela espera no servidor de dados, que é a mesma para
+qualquer servidor de aplicação. Políticas como \emph{least connections} não teriam
+informação útil, pois cada conexão entre balanceador e servidor de aplicação dura
+apenas milissegundos (até o \msg{RECEBIDO}); a carga real fica nos \emph{workers}.
+O contador é um \classe{AtomicInteger}, atualizado de forma atômica por
+\texttt{getAndUpdate(i -> (i+1) \% 3)}, o que evita condições de corrida entre as
+\emph{threads} do balanceador. Se o servidor da vez estiver indisponível, o
+balanceador desvia para o próximo da sequência.
+
+\paragraph{Confirmação imediata (\msg{RECEBIDO}).}
+O servidor de aplicação confirma o recebimento antes de processar. Assim o cliente
+espera apenas milissegundos (e não o processamento completo), mas tem prova de que a
+requisição chegou ao sistema; sem a confirmação, retransmite.
+
+\paragraph{Servidor de aplicação.}
+Para cada requisição é criada uma nova \emph{thread} (\texttt{new Thread}), como
+exige o enunciado. O \emph{worker} verifica a primalidade primeiro (divisão por 2 e
+pelos ímpares até $\sqrt{n}$), sorteia um servidor de dados, aguarda a resposta e
+imprime a frase no formato exato. Se nenhum servidor de dados responder, tenta
+novamente com espera crescente, sem desistir: a requisição já foi confirmada ao
+cliente.
+
+\paragraph{Cliente.}
+Grava o número no log \emph{antes} de enviar (com \emph{flush}), e reenvia o
+\emph{mesmo} número até receber o \msg{RECEBIDO}. O reenvio é seguro porque
+\msg{CHECK} é \textbf{idempotente}: processar o mesmo número duas vezes apenas produz
+``já se encontra no arquivo'' na segunda vez. A parada do cliente acontece sempre
+entre uma requisição e outra, nunca entre gravar no log e enviar.
+
+\paragraph{Fila de conexões (\emph{backlog}).}
+Durante os testes foi encontrado um defeito real: no Windows, quando a fila de
+conexões pendentes de um \classe{ServerSocket} (50 por padrão no Java) enche durante
+uma rajada, o sistema operacional \emph{recusa} as conexões excedentes. Todos os
+servidores passaram a usar uma fila de 1000 posições.
+
+\paragraph{Servidor de dados.}
+Mantém um índice em memória (número $\rightarrow$ linha) reconstruído a partir do
+arquivo na inicialização, o que torna a verificação de existência $O(1)$. A espera
+aleatória de 100 a 300\,ms ocorre \emph{fora} da seção crítica: as esperas de
+várias requisições se sobrepõem, e apenas a parte que exige exclusividade
+(verificar, escrever e replicar) é serializada. Com a espera dentro da seção crítica,
+a vazão máxima seria de cerca de $1/0{,}2\,\text{s} = 5$ requisições por segundo
+para o sistema inteiro, contra cerca de 16 geradas pelos dois clientes, e a fila
+cresceria sem limite.
+
+% ==================================================================
+\section{Fundamentos teóricos}
+\label{sec:fundamentos}
+% ==================================================================
+
+\subsection{O problema da exclusão mútua distribuída}
+
+Uma \textbf{seção crítica} (SC) é um trecho de código que acessa um recurso
+compartilhado e não pode ser executado por mais de um processo ao mesmo tempo. Em um
+único processo, basta um \emph{lock}. Em um sistema distribuído não há memória
+compartilhada nem relógio global, e os processos só se coordenam por mensagens.
+Um algoritmo de exclusão mútua distribuída deve garantir
+\cite{coulouris}:
+
+\begin{description}[leftmargin=1.5cm]
+  \item[Segurança (\emph{safety})] no máximo um processo executa a SC a cada instante;
+  \item[Vivacidade (\emph{liveness})] todo pedido de entrada é atendido em algum
+        momento, o que exclui \emph{deadlock} e inanição (\emph{starvation});
+  \item[Ordenação] se um pedido aconteceu antes de outro (no sentido de Lamport), a
+        entrada na SC respeita essa ordem.
+\end{description}
+
+No projeto, a SC é \emph{verificar se o número existe, inserir se necessário e
+replicar no outro servidor}. Se dois servidores verificassem ao mesmo tempo, ambos
+poderiam concluir que o número não existe e inseri-lo, gerando duplicata ou linhas
+divergentes.
+
+\subsection{Relógios lógicos de Lamport}
+
+Lamport \cite{lamport1978} define a relação \textbf{aconteceu-antes} ($\rightarrow$):
+$a \rightarrow b$ se $a$ e $b$ ocorrem no mesmo processo e $a$ vem antes, ou se $a$
+é o envio de uma mensagem e $b$ é o seu recebimento (e por transitividade). Eventos
+não relacionados são \textbf{concorrentes}.
+
+Cada processo $P_i$ mantém um contador $C_i$, atualizado pelas regras:
+
+\begin{enumerate}[label=\textbf{LC\arabic*.}]
+  \item Antes de cada evento local (incluindo o envio), $C_i \gets C_i + 1$; uma
+        mensagem enviada carrega o valor $t = C_i$.
+  \item Ao receber uma mensagem com marca $t$, $C_i \gets \max(C_i, t) + 1$.
+\end{enumerate}
+
+Essas regras garantem que $a \rightarrow b \Rightarrow C(a) < C(b)$. A recíproca
+não vale: marcas menores não implicam causalidade. Para obter uma \textbf{ordem
+total}, desempata-se pelo identificador do processo:
+\[
+  (t_i, i) < (t_j, j) \iff t_i < t_j \;\lor\; (t_i = t_j \land i < j).
+\]
+É essa ordem total que decide quem entra primeiro na SC.
+
+\subsection{O algoritmo de Ricart-Agrawala}
+
+Ricart e Agrawala \cite{ricart1981} propuseram um algoritmo totalmente distribuído,
+baseado em multicast de pedidos e respostas adiadas. Cada processo tem um estado
+$\in \{\estado{Livre}, \estado{Querendo}, \estado{NaSC}\}$
+(Algoritmo~\ref{alg:ra}).
+
+\begin{algorithm}[H]
+\caption{Ricart-Agrawala para o processo $P_i$ com $N$ processos.}
+\label{alg:ra}
+\begin{algorithmic}[1]
+\Procedure{Entrar}{}
+  \State estado $\gets$ \estado{Querendo}; \ $C_i \gets C_i + 1$; \ $T_i \gets C_i$
+  \State enviar \msg{REQUEST}$(T_i, i)$ aos outros $N-1$ processos
+  \State aguardar $N-1$ respostas \msg{OK}
+  \State estado $\gets$ \estado{NaSC}
+\EndProcedure
+\Statex
+\Procedure{AoReceberRequest}{$T_j, j$}
+  \State $C_i \gets \max(C_i, T_j) + 1$
+  \If{estado $=$ \estado{NaSC} \textbf{ou} (estado $=$ \estado{Querendo} \textbf{e} $(T_i, i) < (T_j, j)$)}
+    \State adiar a resposta (enfileirar $j$)
+  \Else
+    \State enviar \msg{OK} a $P_j$
+  \EndIf
+\EndProcedure
+\Statex
+\Procedure{Sair}{}
+  \State estado $\gets$ \estado{Livre}
+  \State enviar \msg{OK} a todos os pedidos adiados
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Custo.} Cada entrada na SC custa $2(N-1)$ mensagens: $N-1$ pedidos e
+$N-1$ respostas. Com $N = 2$, são \textbf{duas mensagens} (\msg{REQUEST} e
+\msg{OK}). O atraso de sincronização (tempo entre um processo sair e o próximo
+entrar) é de uma única mensagem, o \msg{OK} adiado.
+
+\subsection{Comparação com as alternativas}
+
+\begin{table}[H]
+\centering
+\caption{Algoritmos clássicos de exclusão mútua distribuída, com $N$ processos.}
+\label{tab:comparacao}
+\begin{tabularx}{\textwidth}{@{}lccX@{}}
+\toprule
+\textbf{Algoritmo} & \textbf{Msgs/entrada} & \textbf{Atraso de sinc.} & \textbf{Observações para o projeto} \\
+\midrule
+Coordenador central & 3 & 2 msgs &
+  Exige um processo extra ou tornar um servidor ``chefe'' (assimetria); ponto
+  único de falha. \\
+Token ring & 1 a $\infty$ & 0 a $N-1$ msgs &
+  O token circula mesmo sem requisições; com 2 nós ele fica ``quicando''
+  continuamente; perda do token exige recuperação. \\
+\rowcolor{destaque!8}
+Ricart-Agrawala & $2(N-1)$ & 1 msg &
+  Simétrico, sem coordenador; nenhum tráfego quando ocioso; com $N=2$, apenas
+  \msg{REQUEST} e \msg{OK}. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+A fraqueza conhecida do Ricart-Agrawala é que a falha de \emph{qualquer} processo
+bloqueia os demais, pois todos precisam responder. Com apenas dois servidores de
+dados e replicação síncrona, essa propriedade não é uma desvantagem adicional:
+se o par está fora do ar, a replicação também não pode ser concluída, e o sistema
+precisa esperar de qualquer forma (Seção~\ref{sec:cap}).
+
+\subsection{Modelos de replicação e consistência}
+
+Replicar é manter cópias de um mesmo dado em nós diferentes. As escolhas principais
+são \cite{tanenbaum}:
+
+\begin{itemize}
+  \item \textbf{Síncrona ou assíncrona}: na síncrona, a escrita só é considerada
+        concluída quando todas as réplicas a confirmam; na assíncrona, as réplicas
+        são atualizadas depois, o que permite janelas de divergência.
+  \item \textbf{Primário fixo ou escrita em qualquer réplica}: no primeiro, todas as
+        escritas passam por um nó; no segundo, qualquer réplica aceita escritas e é
+        preciso coordená-las.
+\end{itemize}
+
+A solução adotada é \textbf{escrita em qualquer réplica, coordenada por exclusão
+mútua distribuída, com replicação síncrona}. Como as escritas acontecem uma de cada
+vez (a SC é global) e cada uma só termina após o \msg{ACK} da réplica, todas as
+escritas formam uma única sequência observada igualmente pelos dois servidores. Isso
+caracteriza \textbf{consistência forte}: qualquer leitura, em qualquer servidor,
+reflete todas as escritas concluídas antes dela.
+
+% ==================================================================
+\section{Mecanismo de consistência proposto}
+\label{sec:mecanismo}
+% ==================================================================
+
+\subsection{Fluxo de uma requisição}
+
+A Figura~\ref{fig:sequencia} mostra uma inserção iniciada no servidor de dados 1,
+enquanto o servidor 2 também deseja entrar na SC.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  m/.style={-{Stealth[length=2.2mm]}, thick},
+  ev/.style={font=\scriptsize, align=left},
+]
+% linhas de vida
+\node[draw, rounded corners, fill=white] (w)  at (0,0)   {Worker};
+\node[draw, rounded corners, fill=white] (d1) at (4,0)   {Dados 1};
+\node[draw, rounded corners, fill=white] (d2) at (9.5,0) {Dados 2};
+\foreach \n in {w,d1,d2} \draw[cinza, dashed] (\n.south) -- ++(0,-11.4);
+
+% seção crítica (faixa)
+\fill[destaque!10] (3.6,-4.5) rectangle (4.4,-8.3);
+\node[ev, destaque, rotate=90] at (3.35,-6.4) {seção crítica global};
+
+\draw[m] (0,-1.0) -- node[above] {\msg{CHECK;37}} (4,-1.0);
+\node[ev] at (5.6,-1.6) {dorme 100--300\,ms\\(fora da SC)};
+\node[ev] at (5.7,-2.35) {lock local; $T_1{=}41$};
+\node[ev, right] at (9.6,-2.1) {quer a SC:\\$T_2=43$};
+% pedidos concorrentes (as setas se cruzam)
+\draw[m] (4,-2.9) -- node[above, pos=0.3] {\msg{REQUEST;41;1}} (9.5,-3.3);
+\draw[m] (9.5,-2.7) -- node[above, pos=0.13] {\msg{REQUEST;43;2}} (4,-3.7);
+\node[ev, align=right, left] at (3.9,-4.05) {recebe $(43,2)$; está\\\estado{Querendo} com $(41,1)$\\$\Rightarrow$ \textbf{adia} o OK};
+\node[ev, right] at (9.6,-3.65) {$(41,1) < (43,2)$\\$\Rightarrow$ responde já};
+\draw[m] (9.5,-4.1) -- node[above] {\msg{OK;2}} (4,-4.5);
+\node[ev] at (5.4,-5.1) {37 não existe\\$\Rightarrow$ grava linha 12};
+\draw[m] (4,-5.9) -- node[above] {\msg{REPLICAR;37;12}} (9.5,-6.3);
+\node[ev, right] at (9.6,-6.6) {confere: próxima\\linha livre $=12$;\\grava 37};
+\draw[m] (9.5,-7.4) -- node[above] {\msg{ACK}} (4,-7.8);
+\node[ev] at (5.45,-8.7) {sai da SC; envia\\o OK adiado};
+\draw[m, cinza] (4,-9.25) -- node[below, pos=0.55, font=\scriptsize] {\msg{OK;1} (adiado)} (9.5,-9.65);
+\node[ev, right] at (9.6,-10.0) {agora Dados 2\\entra na SC};
+\draw[m] (4,-9.95) -- node[above] {\msg{INSERIDO;37;12}} (0,-9.95);
+\node[ev, align=center] at (0,-10.9) {imprime a frase\\e termina};
+\end{tikzpicture}
+\caption{Diagrama de sequência de uma inserção com pedidos concorrentes. Os dois
+servidores pedem a SC quase ao mesmo tempo (as setas se cruzam); como
+$(41,1) < (43,2)$, Dados 1 entra primeiro e Dados 2 recebe o \msg{OK} adiado
+quando Dados 1 sai.}
+\label{fig:sequencia}
+\end{figure}
+
+Em texto, o servidor que recebe \msg{CHECK;n}:
+
+\begin{enumerate}
+  \item dorme de 100 a 300\,ms (fora da SC);
+  \item chama \texttt{entrar()}: obtém o \emph{lock} local, incrementa o relógio,
+        envia \msg{REQUEST} ao par e aguarda o \msg{OK};
+  \item na SC: verifica se $n$ existe; se existir, prepara \msg{EXISTE}; se não,
+        grava $n$ na próxima linha, envia \msg{REPLICAR;n;linha} e aguarda o
+        \msg{ACK};
+  \item chama \texttt{sair()}: libera os pedidos adiados e o \emph{lock} local;
+  \item responde ao \emph{worker}.
+\end{enumerate}
+
+\subsection{Decisões de projeto}
+
+\subsubsection{Duas camadas de exclusão mútua}
+
+O Ricart-Agrawala coordena \emph{processos}; porém cada servidor de dados atende
+várias \emph{threads} de \emph{worker} simultaneamente. Por isso \texttt{entrar()}
+tem duas camadas:
+
+\begin{enumerate}
+  \item um \textbf{\emph{lock} local justo} (\classe{ReentrantLock(true)}, ordem de
+        chegada) escolhe qual \emph{thread} do servidor vai disputar a SC;
+  \item essa \emph{thread} executa o Ricart-Agrawala com o par.
+\end{enumerate}
+
+A alternância justa entre os servidores decorre do próprio algoritmo: quando o
+servidor 1 sai da SC, sua próxima \emph{thread} pede com uma marca nova, maior que a
+do pedido pendente do servidor 2 (pois o relógio do servidor 1 foi atualizado ao
+receber esse pedido, regra LC2). Logo o servidor 2 tem prioridade e entra em
+seguida; nenhum servidor monopoliza a SC.
+
+\subsubsection{Resposta adiada como \emph{thread} em espera}
+
+Cada mensagem usa uma conexão TCP própria, no modelo pergunta--resposta, seguindo o
+padrão do restante do sistema. Quando um \msg{REQUEST} chega, a \emph{thread} que
+atende a conexão avalia a regra do Algoritmo~\ref{alg:ra}; se precisar adiar, ela
+espera (\texttt{wait()}) até que \texttt{sair()} a acorde (\texttt{notifyAll()}),
+e então escreve \msg{OK} na mesma conexão. Isso implementa fielmente o ``adiar a
+resposta'' do algoritmo, sem necessidade de manter conexões persistentes, tratar
+reconexões ou garantir ordem FIFO entre mensagens distintas.
+
+\subsubsection{Toda requisição passa pela seção crítica}
+
+Foi considerado um atalho: se o número já está no índice local, responder
+\msg{EXISTE} sem pedir permissão ao par. Seria mais rápido, pois com o tempo a
+maioria das requisições vira \msg{EXISTE}. O atalho foi \textbf{rejeitado} porque
+violaria o requisito R2: um servidor poderia atender uma consulta enquanto recebe
+um \msg{REPLICAR}, isto é, durante a consistência. O custo de seguir o enunciado é
+pequeno: a SC dura poucos milissegundos em \texttt{localhost}, ante cerca de 16
+requisições por segundo.
+
+\subsubsection{Replicação síncrona com conferência de linha}
+
+\msg{REPLICAR;n;linha} carrega a linha em que $n$ foi gravado. O servidor que recebe
+confere que a próxima linha livre do seu arquivo é exatamente essa e que $n$ não
+existe; qualquer divergência é registrada como erro. Como a SC é global, essa
+verificação nunca deve falhar, e por isso funciona como evidência, durante a
+execução, de que os arquivos permanecem idênticos.
+
+O tratamento de \msg{REPLICAR} \emph{não} pede a SC: quem o envia já a detém, e o
+servidor que recebe está, por construção, impedido de entrar nela (seu pedido
+aguarda o \msg{OK}). A escrita local continua protegida pelo \emph{lock} interno do
+arquivo (métodos \texttt{synchronized}), pois chega por outra \emph{thread}.
+
+\subsubsection{Par indisponível: consistência acima de disponibilidade}
+\label{sec:cap}
+
+Se o par não responde, o pedido ou a réplica são reenviados com espera crescente
+(50\,ms dobrando até 1\,s) até o par voltar. O servidor \emph{não} prossegue
+sozinho.
+
+Pelo teorema CAP \cite{brewer2000,gilbert2002}, um sistema distribuído sujeito a
+partições de rede não pode garantir simultaneamente consistência e disponibilidade.
+O projeto escolhe \textbf{consistência}: prosseguir sozinho deixaria os arquivos
+divergentes, contrariando R3. Nenhuma requisição é perdida, pois todas ficam
+aguardando e são atendidas quando o par volta. A mesma regra resolve a ordem de
+inicialização: um servidor que sobe antes do outro simplesmente espera.
+
+\subsection{Estrutura da implementação}
+
+\begin{table}[H]
+\centering
+\caption{Classes envolvidas no mecanismo de consistência.}
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+\textbf{Classe} & \textbf{Responsabilidade} \\
+\midrule
+\classe{ExclusaoMutua}      & Interface com \texttt{entrar()} e \texttt{sair()}. O servidor só conhece esta abstração, o que permite trocar o algoritmo sem alterar o servidor. \\
+\classe{RicartAgrawala}     & Implementa a interface: estado, relógio de Lamport, \emph{lock} local, pedidos e respostas adiadas. \\
+\classe{CanalSync}          & \classe{ServerSocket} na porta de sincronização; trata \msg{REQUEST} e \msg{REPLICAR}; envia mensagens ao par com reenvio. \\
+\classe{ArquivoDados}       & Arquivo e índice em memória; \texttt{consultarOuInserir(n)} e \texttt{inserirReplicado(n, linha)}. \\
+\classe{ServidorDados}      & Atende os \emph{workers} e orquestra: dormir, \texttt{entrar()}, verificar, gravar e replicar, \texttt{sair()}. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+O núcleo do servidor de dados fica assim:
+
+\begin{lstlisting}[language=Java]
+Thread.sleep(100 a 300 ms);            // fora da seção crítica
+exclusao.entrar();                     // lock local + Ricart-Agrawala
+try {
+    r = arquivo.consultarOuInserir(n); // verificação DENTRO da SC
+    if (r.inserido)
+        canal.replicar(n, r.linha);    // REPLICAR -> aguarda ACK
+} finally {
+    exclusao.sair();                   // libera pedidos adiados
+}
+responder(r);                          // INSERIDO ou EXISTE
+\end{lstlisting}
+
+% ==================================================================
+\section{Argumentos de correção}
+\label{sec:correcao}
+% ==================================================================
+
+\paragraph{Segurança (no máximo um servidor na SC).}
+Suponha, por absurdo, que os dois servidores estejam na SC ao mesmo tempo. Cada um
+recebeu o \msg{OK} do outro. Há dois casos:
+\begin{itemize}
+  \item \emph{Os pedidos foram concorrentes}: ambos estavam \estado{Querendo} ao
+        receber o pedido do outro. Como $(T_1,1)$ e $(T_2,2)$ são comparáveis na
+        ordem total, exatamente um deles é menor; o servidor de pedido maior
+        responde e o de pedido menor adia. Logo apenas um recebeu \msg{OK}.
+  \item \emph{Um respondeu enquanto estava \estado{Livre}}: digamos que o servidor
+        2 respondeu ao pedido $(T_1,1)$. Pela regra LC2, $C_2 > T_1$ a partir daí,
+        então um pedido posterior do servidor 2 terá $T_2 > T_1$. O servidor 1,
+        \estado{Querendo} ou \estado{NaSC}, adiará esse pedido até sair.
+\end{itemize}
+Em ambos os casos há contradição. Dentro de cada servidor, o \emph{lock} local
+garante uma única \emph{thread} disputando; portanto no máximo uma \emph{thread} do
+sistema inteiro está na SC.
+
+\paragraph{Ausência de \emph{deadlock}.}
+Um \emph{deadlock} exigiria que cada servidor adiasse o pedido do outro. Isso só
+ocorre se cada pedido for menor que o outro na ordem total, o que é impossível.
+
+\paragraph{Ausência de inanição.}
+Os pedidos são atendidos em ordem crescente de $(T, \text{id})$. Um pedido pendente
+tem marca fixa, e todo pedido novo do outro servidor tem marca maior (regra LC2),
+então o pedido pendente é atendido no máximo após a SC em curso. Localmente, o
+\emph{lock} justo atende as \emph{threads} na ordem de chegada.
+
+\paragraph{Arquivos idênticos e sem duplicatas.}
+Toda escrita ocorre na SC global, após verificação no índice, e só termina após o
+\msg{ACK} da réplica. As escritas são, portanto, totalmente ordenadas e aplicadas na
+mesma ordem e nas mesmas linhas nos dois arquivos; a conferência de linha no
+\msg{REPLICAR} verifica isso a cada escrita.
+
+\paragraph{Nenhuma requisição perdida.}
+A garantia é de ponta a ponta, em cadeia:
+\begin{enumerate}
+  \item o cliente grava no log antes de enviar e reenvia até receber \msg{RECEBIDO};
+  \item o balanceador desvia para outro servidor de aplicação em caso de falha;
+  \item o \emph{worker}, após confirmar, nunca desiste do servidor de dados;
+  \item o servidor de dados bloqueia (não descarta) requisições durante a
+        consistência e espera o par se ele estiver indisponível;
+  \item os reenvios são seguros porque \msg{CHECK} é idempotente;
+  \item a parada do sistema encerra primeiro os clientes (entre requisições) e
+        espera os servidores esvaziarem antes de fechá-los.
+\end{enumerate}
+
+% ==================================================================
+\section{Plano de testes}
+\label{sec:testes}
+% ==================================================================
+
+\begin{enumerate}
+  \item \textbf{Execução completa} (cerca de 30\,s, depois parada ordenada):
+        \texttt{dados1.txt} e \texttt{dados2.txt} idênticos; nenhum com duplicatas;
+        todo número distinto dos logs presente nos arquivos; número de frases
+        impressas igual ao número de linhas dos logs.
+  \item \textbf{Estresse da exclusão mútua}: 100 requisições simultâneas ao
+        servidor 1 e outras 100 ao servidor 2, ao mesmo tempo, com números de 1 a
+        30. Nenhum número pode ser inserido duas vezes no conjunto dos dois
+        servidores, e cada linha deve conter um único número.
+  \item \textbf{Par indisponível}: derrubar o servidor 2 com o sistema em execução.
+        As requisições do servidor 1 devem aguardar, sem perda, e ser retomadas
+        quando o servidor 2 voltar; os arquivos devem permanecer idênticos.
+  \item \textbf{Unicidade das linhas}: nas frases dos três servidores de aplicação,
+        nenhuma linha pode aparecer como ``inserido na linha $Y$'' mais de uma vez.
+\end{enumerate}
+
+% ==================================================================
+\section{Limitações conhecidas}
+\label{sec:limitacoes}
+% ==================================================================
+
+\begin{itemize}
+  \item \textbf{Falha dentro da SC}: se um servidor morrer depois de gravar
+        localmente e antes de o \msg{REPLICAR} chegar ao par, os arquivos ficam com
+        uma linha de diferença. Resolver isso exigiria um protocolo de recuperação
+        (sincronizar o estado ao reconectar) ou de \emph{commit} atômico (por
+        exemplo, \emph{two-phase commit}), o que extrapola o escopo do enunciado.
+  \item \textbf{Disponibilidade}: por escolha de projeto (Seção~\ref{sec:cap}), se um
+        servidor de dados cair, o outro deixa de concluir requisições até ele
+        voltar. As requisições não se perdem, mas aguardam.
+  \item \textbf{Escalabilidade}: com $N$ servidores, cada entrada custaria
+        $2(N-1)$ mensagens e todos precisariam estar ativos. Para dois servidores
+        o custo é mínimo.
+  \item \textbf{Vazão}: toda requisição, inclusive de números já existentes, passa
+        pela SC global. A vazão é limitada pela duração da SC (poucos
+        milissegundos), suficiente para a carga do projeto.
+\end{itemize}
+
+% ==================================================================
+\section{Perguntas prováveis na apresentação}
+% ==================================================================
+
+\begin{description}[style=nextline, leftmargin=0.6cm]
+  \item[Por que não usar um \emph{lock} comum, como \texttt{synchronized}?]
+    Ele vale apenas dentro de um processo. Os dois servidores de dados são processos
+    independentes (simulando máquinas diferentes), sem memória compartilhada; a
+    coordenação precisa ser por mensagens.
+  \item[Para que serve o relógio de Lamport, se só há dois processos?]
+    Para decidir, sem relógio físico comum, qual de dois pedidos simultâneos tem
+    prioridade, e para garantir que um pedido feito depois de receber outro tenha
+    marca maior, o que evita inanição.
+  \item[O que acontece se os dois pedirem ao mesmo tempo com a mesma marca?]
+    Desempata-se pelo identificador: $(41,1) < (41,2)$, então o servidor 1 entra
+    primeiro e o servidor 2 entra assim que ele sai.
+  \item[Por que a verificação de existência fica dentro da SC?]
+    Fora dela, os dois servidores poderiam verificar o mesmo número ao mesmo tempo,
+    ambos concluir que ele não existe e ambos inseri-lo.
+  \item[Por que replicação síncrona e não assíncrona?]
+    O enunciado exige que nenhuma requisição seja atendida antes do fim da
+    consistência e que os arquivos sejam iguais a cada escrita. A replicação
+    assíncrona abriria uma janela em que os arquivos divergem.
+  \item[Por que não token ring?]
+    Com dois nós, o token circularia continuamente mesmo sem requisições, e a perda
+    do token exigiria um mecanismo de recuperação. O Ricart-Agrawala só troca
+    mensagens quando alguém quer entrar na SC.
+  \item[E se um servidor de dados cair?]
+    O outro espera e reenvia; as requisições ficam retidas, não perdidas. Foi
+    escolhida a consistência acima da disponibilidade (teorema CAP).
+\end{description}
+
+% ==================================================================
+\begin{thebibliography}{9}
+% ==================================================================
+\bibitem{lamport1978}
+L.~Lamport.
+\newblock Time, clocks, and the ordering of events in a distributed system.
+\newblock \emph{Communications of the ACM}, 21(7):558--565, 1978.
+
+\bibitem{ricart1981}
+G.~Ricart e A.~K. Agrawala.
+\newblock An optimal algorithm for mutual exclusion in computer networks.
+\newblock \emph{Communications of the ACM}, 24(1):9--17, 1981.
+
+\bibitem{coulouris}
+G.~Coulouris, J.~Dollimore, T.~Kindberg e G.~Blair.
+\newblock \emph{Distributed Systems: Concepts and Design}.
+\newblock 5.~ed. Addison-Wesley, 2011.
+
+\bibitem{tanenbaum}
+A.~S. Tanenbaum e M.~van Steen.
+\newblock \emph{Distributed Systems}.
+\newblock 3.~ed. Pearson, 2017.
+
+\bibitem{brewer2000}
+E.~A. Brewer.
+\newblock Towards robust distributed systems.
+\newblock Palestra no \emph{ACM Symposium on Principles of Distributed Computing
+  (PODC)}, 2000.
+
+\bibitem{gilbert2002}
+S.~Gilbert e N.~Lynch.
+\newblock Brewer's conjecture and the feasibility of consistent, available,
+  partition-tolerant web services.
+\newblock \emph{ACM SIGACT News}, 33(2):51--59, 2002.
+\end{thebibliography}
+
+\end{document}

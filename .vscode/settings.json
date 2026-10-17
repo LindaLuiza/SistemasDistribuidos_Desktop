@@ -1,0 +1,31 @@
+{
+    "a-file-icon-vscode.activeIconPacks": [
+        "angular",
+        "rails"
+    ],
+
+    // LaTeX Workshop: compila com pdflatex direto (o latexmk do MiKTeX exige Perl,
+    // que não está instalado). Duas passadas para o sumário e as referências.
+    // Caminho absoluto para funcionar mesmo antes de o VS Code recarregar o PATH.
+    "latex-workshop.latex.tools": [
+        {
+            "name": "pdflatex",
+            "command": "C:\\Users\\linda\\AppData\\Local\\Programs\\MiKTeX\\miktex\\bin\\x64\\pdflatex.exe",
+            "args": [
+                "-synctex=1",
+                "-interaction=nonstopmode",
+                "-file-line-error",
+                "%DOC%"
+            ]
+        }
+    ],
+    "latex-workshop.latex.recipes": [
+        {
+            "name": "pdflatex (2 passadas)",
+            "tools": ["pdflatex", "pdflatex"]
+        }
+    ],
+    "latex-workshop.latex.recipe.default": "first",
+    // Apaga .aux, .log, .toc etc. depois de compilar com sucesso
+    "latex-workshop.latex.autoClean.condition": ["onSucceeded"]
+}
